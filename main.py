@@ -1,132 +1,113 @@
-import io
 from typing import Annotated, Literal
 
-import pandas as pd
 from pydantic import Field
 
 from mistralai import agents
 
-_df: pd.DataFrame | None = None
-_df_name: str | None = None
-
-_OPS = {
-    "==": lambda s, v: s == v,
-    "!=": lambda s, v: s != v,
-    ">": lambda s, v: s > v,
-    ">=": lambda s, v: s >= v,
-    "<": lambda s, v: s < v,
-    "<=": lambda s, v: s <= v,
-    "contains": lambda s, v: s.astype(str).str.contains(str(v), case=False, na=False),
-    "in": lambda s, v: s.isin(v if isinstance(v, list) else [v]),
-}
-
-AggFunc = Literal["sum", "mean", "median", "min", "max", "count", "nunique", "std"]
-
-
-def _require_loaded() -> pd.DataFrame:
-    if _df is None:
-        raise agents.ToolError(
-            "Nenhum CSV carregado. Use o conector do Google Drive para ler o arquivo e passe o "
-            "conteúdo para load_csv."
-        )
-    return _df
+Focus = Literal["all", "bugs", "security", "ux", "style"]
 
 
 @agents.tool
-async def load_csv(
-    content: Annotated[str, Field(description="Conteúdo CSV completo, lido do Google Drive.")],
-    name: Annotated[str, Field(description="Nome para referenciar o arquivo depois.")] = "dados",
+async def review_code(
+    code: Annotated[str, Field(description="Código a revisar.")],
+    focus: Annotated[Focus, Field(description="Foco: all, bugs, security, ux ou style.")] = "all",
 ) -> str:
-    """Carrega um CSV do Google Drive para análise. Perguntas seguintes usam este arquivo."""
-    global _df, _df_name
-    _df = pd.read_csv(io.StringIO(content))
-    _df_name = name
-    return (
-        f"Carregado {name}: {len(_df)} linhas, {len(_df.columns)} colunas. "
-        "Use describe_columns para ver os detalhes."
-    )
+    """Revisa código: bugs, segurança, UX e estilo. Devolve uma lista de achados."""
+    findings: list[str] = []
+    lines = code.splitlines()
+    if not lines:
+        return "Nada a revisar: código vazio."
+
+    joined = "\n".join(lines)
+    lowered = joined.lower()
+
+    if focus in ("all", "security"):
+        for pattern in ("api_key", "apikey", "secret", "password", "token", "bearer "):
+            if pattern in lowered:
+                findings.append(
+                    f"Segurança: possível segredo no código ({pattern!r}); mova para variável de ambiente."
+                )
+        for pattern in ("eval(", "exec(", "os.system(", "subprocess."):
+            if pattern in lowered:
+                findings.append(
+                    f"Segurança: execução dinâmica com {pattern!r}; evite input não tratado."
+                )
+        for pattern in ("select * from", "insert into", "update ", "delete from"):
+            if pattern in lowered and ("+" in joined or "f\"" in lowered or "f'" in lowered):
+                findings.append(
+                    "Segurança: possível injeção de SQL por concatenação; use query parametrizada."
+                )
+
+    if focus in ("all", "bugs"):
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith("#") and len(stripped) > 2:
+                continue
+            if " == None" in line or " != None" in line:
+                findings.append(f"Bug provável na linha {number}: compare com `is None`.")
+            if "except:" in line:
+                findings.append(f"Estilo na linha {number}: `except:` pega-tudo; liste as exceções.")
+            if "TODO" in line.upper():
+                findings.append(f"Pendente na linha {number}: {stripped}")
+
+    if focus in ("all", "ux"):
+        if "input(" in lowered and "int(" not in lowered and "float(" not in lowered:
+            findings.append("UX: `input()` sem conversão de tipo; valide antes de usar.")
+        if "print(" in lowered and "input(" in lowered:
+            findings.append("UX: mistura de leitura e escrita no terminal; separe entrada e saída.")
+
+    if focus in ("all", "style"):
+        for number, line in enumerate(lines, start=1):
+            if len(line) > 88:
+                findings.append(f"Estilo: linha {number} passa de 88 colunas.")
+            if line != line.rstrip():
+                findings.append(f"Estilo: espaço no fim da linha {number}.")
+
+    if not findings:
+        return "Nenhum achado no foco escolhido."
+    return f"{len(findings)} achado(s):\n" + "\n".join(f"- {finding}" for finding in findings)
 
 
 @agents.tool
-async def describe_columns() -> str:
-    """Descreve as colunas do CSV carregado: nome, tipo, nulos e valores de exemplo."""
-    frame = _require_loaded()
-    lines = [f"Arquivo: {_df_name}", ""]
-    for column in frame.columns:
-        series = frame[column]
-        sample = series.dropna().head(3).tolist()
-        lines.append(
-            f"- {column} ({series.dtype}): {int(series.isna().sum())} nulos; ex.: {sample}"
-        )
-    lines.append("")
-    lines.append(f"Total: {len(frame)} linhas.")
-    return "\n".join(lines)
-
-
-@agents.tool
-async def filter_rows(
-    column: Annotated[str, Field(description="Coluna a filtrar.")],
-    operator: Annotated[str, Field(description="Operador: ==, !=, >, >=, <, <=, contains ou in.")],
-    value: Annotated[str | list[str] | int | float, Field(description="Valor de comparação.")],
+async def security_check(
+    code: Annotated[str, Field(description="Código a verificar.")],
 ) -> str:
-    """Filtra as linhas do CSV carregado por uma condição e devolve um resumo do resultado."""
-    frame = _require_loaded()
-    if column not in frame.columns:
-        raise agents.ToolError(
-            f"Coluna {column!r} não existe. Colunas: {list(frame.columns)}"
-        )
-    if operator not in _OPS:
-        raise agents.ToolError(f"Operador {operator!r} não suportado. Use: {sorted(_OPS)}")
-    series = frame[column]
-    mask = _OPS[operator](series, value)
-    matched = frame[mask]
-    return (
-        f"{len(matched)} de {len(frame)} linhas casam com {column} {operator} {value!r}. "
-        f"Prévia: {matched.head(5).to_dict(orient='records')}"
-    )
+    """Checagem de segurança (OWASP): segredos, injeção, execução dinâmica."""
+    return await review_code(code, focus="security")
 
 
 @agents.tool
-async def group_aggregate(
-    group_by: Annotated[str, Field(description="Coluna para agrupar.")],
-    agg_column: Annotated[str, Field(description="Coluna numérica a agregar.")],
-    agg_func: Annotated[
-        AggFunc | list[AggFunc],
-        Field(description="Uma função ou uma lista: sum, mean, median, min, max, count, nunique ou std."),
-    ] = "sum",
+async def ux_critique(
+    description: Annotated[str, Field(description="Descrição da tela ou do fluxo de UI.")],
 ) -> str:
-    """Agrupa o CSV carregado por uma coluna e calcula um ou mais agregados sobre outra."""
-    frame = _require_loaded()
-    for name in (group_by, agg_column):
-        if name not in frame.columns:
-            raise agents.ToolError(f"Coluna {name!r} não existe. Colunas: {list(frame.columns)}")
-    funcs = agg_func if isinstance(agg_func, list) else [agg_func]
-    for func in funcs:
-        if func not in AggFunc.__args__:
-            raise agents.ToolError(f"Agregado {func!r} não suportado. Use: {list(AggFunc.__args__)}")
-    grouped = frame.groupby(group_by)[agg_column].agg(funcs)
-    if isinstance(grouped, pd.Series):
-        grouped = grouped.to_frame()
-    return grouped.sort_values(by=list(grouped.columns)[0], ascending=False).head(20).to_string()
+    """Critica uma descrição de UI/UX com heurísticas de usabilidade."""
+    findings: list[str] = []
+    lowered = description.lower()
+    if "senha" in lowered or "password" in lowered:
+        findings.append("UX: campo de senha deve mascarar a entrada e ter botão de mostrar/ocultar.")
+    if "formulário" in lowered or "form" in lowered:
+        findings.append("UX: valide no cliente e no servidor; mostre o erro perto do campo.")
+    if "tabela" in lowered or "lista" in lowered:
+        findings.append("UX: limite o que a tela mostra por vez e ofereça busca paginação.")
+    if not findings:
+        findings.append("UX: descreva a tela com mais detalhe para uma crítica útil.")
+    return f"{len(findings)} ponto(s):\n" + "\n".join(f"- {finding}" for finding in findings)
 
 
 agent = agents.Agent(
     model="mistral-large-4",
-    name="analista-dados",
+    name="dev-expert",
     instructions=(
-        "Você é um analista de dados conversacional. O usuário cola um link de um arquivo CSV "
-        "do Google Drive e faz perguntas em linguagem simples sobre os dados.\n\n"
+        "Você é um especialista em programação, UI/UX e segurança. O usuário cola código, "
+        "descreve uma tela ou pergunta conceitos, e você responde com análise prática.\n\n"
         "Fluxo:\n"
-        "1. Use o conector do Google Drive (google_drive_mcp) para achar o arquivo do link.\n"
-        "2. Leia o conteúdo do CSV com as ferramentas do conector.\n"
-        "3. Passe o conteúdo para load_csv.\n"
-        "4. Use describe_columns para entender as colunas antes da primeira pergunta.\n"
-        "5. Responda com filter_rows e group_aggregate, citando números reais.\n\n"
-        "Nunca invente números: toda resposta vem do resultado de uma ferramenta. Lembre-se do "
-        "arquivo carregado e de tudo que já foi discutido — o usuário não precisa repetir o link "
-        "nem re-explicar o contexto entre perguntas. Se uma coluna não existir, liste as que "
-        "existem; se um operador não for suportado, diga quais são."
+        "1. Código colado: use review_code (e security_check para o foco em segurança).\n"
+        "2. Descrição de tela: use ux_critique.\n"
+        "3. Repositório, PR ou issue: use o conector do GitHub para ler.\n"
+        "4. Escreva ou refatore código quando pedirem.\n\n"
+        "Regra: toda crítica vem da análise, não de achismo — cite a linha ou o trecho. "
+        "Se um trecho não couber na resposta, diga o que faltou ver."
     ),
-    connectors=[agents.connector("google_drive_mcp")],
-    tools=[load_csv, describe_columns, filter_rows, group_aggregate],
+    connectors=[agents.connector("github")],
+    tools=[review_code, security_check, ux_critique],
 )
